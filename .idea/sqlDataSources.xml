@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="DdlMappings">
+    <mapping uuid="991de967-0615-4c62-b67e-36cdbfe95998" name="nsu_db@localhost Mapping">
+      <data-sources db="e439a507-3e94-4cf3-bd8c-9a4c1b3c1f6d" />
+      <scope>
+        <node negative="1">
+          <node kind="database" negative="1" />
+          <node kind="database" qname="nsu_db">
+            <node kind="schema" negative="1" />
+          </node>
+        </node>
+      </scope>
+    </mapping>
+  </component>
+</project>
