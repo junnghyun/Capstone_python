@@ -1,209 +1,184 @@
 from flask import Flask, jsonify
-from ultralytics import YOLO
+import os
 import cv2
 import numpy as np
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import os
+from ultralytics import YOLO
 import logging
-from typing import List, Tuple, Optional, Dict, Any
-from geopy.distance import geodesic  # 지오디스틱 거리 계산 추가
+import psycopg2
+from psycopg2 import sql
+from shapely import wkb
 
+# Flask 애플리케이션 생성
 app = Flask(__name__)
 
-# YOLO 모델 로드
-yolo_model = YOLO('mshamrai/yolov8n-visdrone')
+# 로그 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# PostgreSQL 데이터베이스 연결 설정
-database_url = 'postgresql://postgres:postgres@localhost:5432/nsu_db'
+# YOLO 모델 로드
+model = YOLO('mshamrai/yolov8n-visdrone')
+logging.info("YOLO 모델 로드 완료.")
+
+# PostgreSQL 연결 설정 (데이터베이스 1 - 이미지 가져오기)
+conn_src = psycopg2.connect(
+    host="localhost",
+    database="nsu_db",
+    user="your_user",
+    password="your_password"
+)
+
+# PostgreSQL 연결 설정 (데이터베이스 2 - 결과 저장)
+conn_dst = psycopg2.connect(
+    host="localhost",
+    database="destination_db",
+    user="your_user",
+    password="your_password"
+)
+
+# 경로 설정
+output_folder = r"C:\Users\NSU\Desktop\output"
+os.makedirs(output_folder, exist_ok=True)
 
 
-def get_image_data() -> Optional[Dict[str, Any]]:
-    """
-    데이터베이스에서 이미지 경로와 좌표를 가져오는 함수
-    """
-    conn = psycopg2.connect(database_url)
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    cursor.execute(
-        "SELECT image_path, ST_AsText(top_left) as top_left, "
-        "ST_AsText(top_right) as top_right, ST_AsText(bottom_left) as bottom_left, "
-        "ST_AsText(bottom_right) as bottom_right FROM upload LIMIT 1"
-    )
-    data = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return data
+def get_images_from_db(conn):
+    """PostgreSQL DB에서 이미지 경로 및 변환된 모서리 좌표(위경도) 가져오기"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, image_path, top_left, top_right, bottom_left, bottom_right FROM upload")
+        rows = cur.fetchall()
+        images_data = []
+        for row in rows:
+            image_id, image_path, tl, tr, bl, br = row
+            # 각 좌표를 Point로 변환 (Shapely)
+            top_left = wkb.loads(tl, hex=True)
+            top_right = wkb.loads(tr, hex=True)
+            bottom_left = wkb.loads(bl, hex=True)
+            bottom_right = wkb.loads(br, hex=True)
+            images_data.append({
+                "id": image_id,
+                "path": image_path,
+                "corners": [top_left, top_right, bottom_left, bottom_right]
+            })
+        return images_data
 
 
-def affine_calculate(
-    x1: float, y1: float, x2: float, y2: float, x3: float, y3: float,
-    x1_target: float, y1_target: float, x2_target: float, y2_target: float,
-    x3_target: float, y3_target: float
-) -> np.ndarray:
-    """
-    아핀 변환 행렬을 계산하는 함수
-    """
-    img_array = np.array([[x1, y1], [x2, y2], [x3, y3]], dtype=np.float32)
-    next_array = np.array([[x1_target, y1_target], [x2_target, y2_target], [x3_target, y3_target]], dtype=np.float32)
-    return cv2.getAffineTransform(img_array, next_array)
+def save_result_to_db(conn, image_id, image_path, corners):
+    """처리된 이미지 결과를 DB에 저장"""
+    with conn.cursor() as cur:
+        query = sql.SQL("""
+            INSERT INTO processed_images (image_id, image_path, top_left, top_right, bottom_left, bottom_right)
+            VALUES (%s, %s, ST_GeomFromText(%s, 5186), ST_GeomFromText(%s, 5186), ST_GeomFromText(%s, 5186), ST_GeomFromText(%s, 5186))
+        """)
+        cur.execute(query, [
+            image_id,
+            image_path,
+            corners[0].wkt,
+            corners[1].wkt,
+            corners[2].wkt,
+            corners[3].wkt
+        ])
+    conn.commit()
 
 
-def process_image(
-    image_path: str, model: YOLO
-) -> Tuple[Optional[np.ndarray], Optional[List[List[int]]]]:
-    """
-    이미지를 로드하고 YOLO 모델로 객체 탐지 후 객체가 있는 부분을 0으로 채우는 함수
-    """
-    img = cv2.imread(image_path)
-    if img is None:
-        logging.error(f"이미지를 읽을 수 없습니다: {image_path}")
-        return None, None
+def apply_affine_transform(coord, affine_matrix):
+    """Affine 변환 적용"""
+    x, y = coord
+    re_coord = np.dot(affine_matrix, np.array([x, y, 1]))
+    return int(re_coord[0]), int(re_coord[1])
 
-    results = model(img)
-    object_boxes = []
+
+def process_images(images_data, output_folder, model):
+    """이미지를 처리하고 탐지된 결과를 0으로 만듦"""
+    if len(images_data) < 2:
+        logging.error("처리할 이미지가 충분하지 않습니다.")
+        return None
+
+    # 첫 번째 이미지를 기준으로 사용
+    reference_image_data = images_data[0]
+    reference_image_path = reference_image_data['path']
+    corners = reference_image_data['corners']
+
+    # 이미지 로드
+    reference_image = cv2.imread(reference_image_path)
+    if reference_image is None:
+        logging.error(f"{reference_image_path} 이미지를 읽을 수 없음.")
+        return None
+
+    # YOLOv8 모델로 객체 탐지
+    results = model(reference_image)
+    object_boxes = []  # 탐지된 BBox 저장 리스트
+
     for result in results:
         boxes = result.boxes
         for box in boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
             x1 = max(0, x1 - 25)
             y1 = max(0, y1 - 25)
-            x2 = min(img.shape[1], x2 + 25)
-            y2 = min(img.shape[0], y2 + 25)
+            x2 = min(reference_image.shape[1], x2 + 25)
+            y2 = min(reference_image.shape[0], y2 + 25)
             object_boxes.append([x1, y1, x2, y2])
 
+    logging.info(f"{reference_image_path}에서 {len(object_boxes)}개의 객체를 탐지함.")
+
+    # 탐지된 객체 부분을 0으로 설정 (컬러 이미지일 경우 [0, 0, 0]으로 설정)
     if object_boxes:
         for box in object_boxes:
-            x1, y1, x2, y2 = map(int, box)
-            img[y1:y2, x1:x2] = 0
-        return img, object_boxes
+            x1, y1, x2, y2 = box
+            reference_image[y1:y2, x1:x2] = [0, 0, 0]  # 컬러 이미지의 경우 [0, 0, 0]으로 설정
+
+    # 다른 이미지에서 0이 아닌 값으로 대체
+    other_image_data = images_data[1]  # 다른 이미지를 가져옴
+    other_image_path = other_image_data['path']
+    other_image = cv2.imread(other_image_path)
+    if other_image is None:
+        logging.error(f"{other_image_path} 이미지를 읽을 수 없음.")
     else:
-        return img, None
+        # 0으로 채워진 영역의 좌표 찾기 및 대체
+        zero_coords = np.argwhere(np.all(reference_image == [0, 0, 0], axis=-1))  # [0, 0, 0]으로 수정
+        if len(zero_coords) == 0:
+            logging.info("0으로 채워진 영역이 없음.")
+        else:
+            # 어핀 변환은 이미 계산된 ref_to_next_aff 사용
+            # ref_to_next_aff 행렬은 이미지 처리 로직에 따라 정의되어야 함
+            ref_to_next_aff = np.eye(3)  # Placeholder, 실제 어핀 변환 행렬로 대체해야 함
+            for coord in zero_coords:
+                y, x = coord
 
+                # 어핀 변환 행렬(ref_to_next_aff)을 사용
+                re_coord = np.dot(ref_to_next_aff, np.array([x, y, 1]))
+                re_x, re_y = int(re_coord[0]), int(re_coord[1])
 
-def replace_pixels(
-    reference_img: np.ndarray, processed_images: List[str],
-    processed_folder: str, affine_matrix: np.ndarray,
-    original_coords: List[Tuple[float, float]],  # 좌표 추가
-    threshold_distance: float = 5.0  # 5미터 이내의 거리만 허용
-) -> np.ndarray:
-    """
-    0으로 채워진 영역에 대해 다른 이미지에서 픽셀 값을 대입하는 함수, 5m 이내로 겹치는 영역만 처리
-    """
-    zero_coords = []
-
-    # 첫 번째 이미지의 좌표 정보를 기준으로 픽셀 대체 작업
-    for image_file in processed_images:
-        processed_image_path = os.path.join(processed_folder, image_file)
-        img = cv2.imread(processed_image_path)
-        if img is None:
-            logging.error(f"이미지를 읽을 수 없습니다: {processed_image_path}")
-            continue
-
-        coords = np.argwhere(np.all(reference_img == [0, 0, 0], axis=-1))
-        for coord in coords:
-            y, x = coord
-            zero_coords.append((y, x))
-
-    zero_coords = list(set(zero_coords))
-
-    # 다른 이미지들과 비교하여 거리 계산
-    for other_image_file in processed_images[1:]:
-        other_image_path = os.path.join(processed_folder, other_image_file)
-        other_image = cv2.imread(other_image_path)
-        if other_image is None:
-            logging.error(f"이미지를 읽을 수 없습니다: {other_image_path}")
-            continue
-
-        # 원래 좌표와의 거리 비교
-        for coord in zero_coords:
-            y, x = coord
-
-            # 원래 이미지의 좌표와 비교할 좌표간의 거리를 계산합니다.
-            # 이 부분은 이미지 상의 픽셀이 실제 공간의 좌표와 연결되어 있다고 가정합니다.
-            re_coord = np.dot(affine_matrix, np.array([x, y, 1]))
-            re_x, re_y = int(re_coord[0]), int(re_coord[1])
-
-            # 현재 픽셀과 원래 좌표 간의 실제 거리를 계산
-            distance = geodesic(original_coords[0], (re_x, re_y)).meters
-
-            # 5미터 이내인지 확인 후 인페인팅 작업
-            if distance <= threshold_distance:
+                # 다른 이미지의 값을 대입
                 if 0 <= re_y < other_image.shape[0] and 0 <= re_x < other_image.shape[1]:
-                    if 0 <= y < reference_img.shape[0] and 0 <= x < reference_img.shape[1]:
-                        reference_img[y, x] = other_image[re_y, re_x]
+                    ref_pixel_value = other_image[re_y, re_x]
+                    reference_image[y, x] = ref_pixel_value  # 다른 이미지의 값을 참조 이미지에 대입
 
-    return reference_img
+    # 처리된 이미지 저장
+    output_image_path = os.path.join(output_folder, os.path.basename(reference_image_path))
+    cv2.imwrite(output_image_path, reference_image)  # Ensure image is of type ndarray
+    logging.info(f"{output_image_path}에 처리된 이미지 저장 완료.")
+
+    # 처리된 이미지 및 좌표 DB에 저장
+    save_result_to_db(conn_dst, reference_image_data['id'], output_image_path, corners)
+
+    return output_image_path
 
 
 @app.route('/flask-endpoint', methods=['POST'])
-def process_request() -> jsonify:
-    """
-    POST 요청을 처리하여 이미지 경로와 좌표를 데이터베이스에서 가져오고 이미지 처리 및 픽셀 교체를 수행하는 엔드포인트
-    """
+def flask_endpoint():
+    """Flask 엔드포인트: 이미지 처리 요청을 처리하는 엔드포인트"""
     try:
-        # 데이터베이스에서 이미지 데이터 가져오기
-        data = get_image_data()
-        if not data:
-            logging.error("데이터베이스에서 데이터를 찾을 수 없습니다.")
-            return jsonify({"error": "No data found in the database"}), 404
-
-        # 좌표 데이터 파싱
-        image_path = data['image_path']
-        coords = ['top_left', 'top_right', 'bottom_left', 'bottom_right']
-        points = {}
-        for coord in coords:
-            point = data[coord].replace('POINT(', '').replace(')', '').split()
-            points[coord] = [float(p) for p in point]
-
-        # 원래 좌표 저장
-        original_coords = [(points['top_left'][0], points['top_left'][1]),
-                           (points['top_right'][0], points['top_right'][1]),
-                           (points['bottom_left'][0], points['bottom_left'][1]),
-                           (points['bottom_right'][0], points['bottom_right'][1])]
-
-        # 아핀 변환 행렬 계산
-        x1, y1 = points['top_left']
-        x2, y2 = points['top_right']
-        x3, y3 = points['bottom_left']
-        x1_target, y1_target = points['top_left']
-        x2_target, y2_target = points['top_right']
-        x3_target, y3_target = points['bottom_right']
-        affine_matrix = affine_calculate(
-            x1, y1, x2, y2, x3, y3, x1_target, y1_target, x2_target, y2_target, x3_target, y3_target
-        )
-
-        # 이미지 처리
-        img, object_boxes = process_image(image_path, yolo_model)
-        if img is None:
-            logging.error("이미지 처리에 실패했습니다.")
-            return jsonify({"error": "Failed to process image"}), 500
-
-        # 처리된 이미지 저장
-        processed_folder = 'processed_images'
-        os.makedirs(processed_folder, exist_ok=True)
-        processed_image_path = os.path.join(processed_folder, os.path.basename(image_path))
-        cv2.imwrite(processed_image_path, img)
-
-        # 픽셀 교체 작업 수행 (5미터 이내로 제한)
-        reference_img = img.copy()
-        processed_images = [os.path.basename(image_path)]
-        result_image = replace_pixels(
-            reference_img, processed_images, processed_folder, affine_matrix, original_coords
-        )
-
-        # 결과 이미지 저장
-        output_folder = 'output_images'
-        os.makedirs(output_folder, exist_ok=True)
-        output_image_path = os.path.join(output_folder, os.path.basename(image_path))
-        cv2.imwrite(output_image_path, result_image)
-
-        return jsonify({"message": "Image processing complete", "output_image_path": output_image_path})
-
+        images_data = get_images_from_db(conn_src)
+        if images_data:
+            processed_image_path = process_images(images_data, output_folder, model)
+            if processed_image_path:
+                return jsonify({"message": "처리된 이미지 경로", "path": processed_image_path}), 200
+            else:
+                return jsonify({"message": "이미지 처리에 실패했습니다."}), 500
+        else:
+            return jsonify({"message": "데이터베이스에서 이미지를 가져오지 못했습니다."}), 500
     except Exception as e:
-        logging.error(f"오류가 발생했습니다: {str(e)}")
-        return jsonify({"error": "An internal error occurred"}), 500
+        logging.error(f"예외 발생: {str(e)}")
+        return jsonify({"message": "서버 내부 오류", "error": str(e)}), 500
 
 
-if __name__ == '__main__':
-    app.run('0.0.0.0', 5000)
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=5000)
