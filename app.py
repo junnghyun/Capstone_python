@@ -18,21 +18,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 model = YOLO('mshamrai/yolov8n-visdrone')
 logging.info("YOLO 모델 로드 완료.")
 
-# PostgreSQL 연결 설정 (데이터베이스 1 - 이미지 가져오기)
+# PostgreSQL 연결 설정
 conn_src = psycopg2.connect(
     host="localhost",
     database="nsu_db",
-    user="your_user",
-    password="your_password"
+    user="postgres",
+    password="postgres"
 )
 
-# PostgreSQL 연결 설정 (데이터베이스 2 - 결과 저장)
-conn_dst = psycopg2.connect(
-    host="localhost",
-    database="destination_db",
-    user="your_user",
-    password="your_password"
-)
 
 # 경로 설정
 output_folder = r"C:\Users\NSU\Desktop\output"
@@ -132,7 +125,7 @@ def process_images(images_data, output_folder, model):
         logging.error(f"{other_image_path} 이미지를 읽을 수 없음.")
     else:
         # 0으로 채워진 영역의 좌표 찾기 및 대체
-        zero_coords = np.argwhere(np.all(reference_image == [0, 0, 0], axis=-1))  # [0, 0, 0]으로 수정
+        zero_coords = np.argwhere(np.all(reference_image == [10, 10, 10], axis=-1))
         if len(zero_coords) == 0:
             logging.info("0으로 채워진 영역이 없음.")
         else:
@@ -157,7 +150,7 @@ def process_images(images_data, output_folder, model):
     logging.info(f"{output_image_path}에 처리된 이미지 저장 완료.")
 
     # 처리된 이미지 및 좌표 DB에 저장
-    save_result_to_db(conn_dst, reference_image_data['id'], output_image_path, corners)
+    save_result_to_db(conn_src, reference_image_data['id'], output_image_path, corners)
 
     return output_image_path
 
